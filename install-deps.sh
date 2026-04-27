@@ -40,6 +40,9 @@ pacman_pkgs=(
     wl-clipboard
     jq
 
+    # Touchpad-on-terminal script (Hyprland IPC listener)
+    socat
+
     # Audio / brightness / media keys
     wireplumber
     brightnessctl
