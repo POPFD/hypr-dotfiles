@@ -22,10 +22,11 @@ from evdev import InputDevice, UInput, ecodes, list_devices
 
 TOUCHPAD_NAME_FRAGMENT = "Touchpad"
 TERMINAL_CLASS = "kitty"
-HYPR_EVENT_PREFIXES = (
-    b"openwindow", b"closewindow", b"movewindow",
-    b"workspace", b"focusedmon", b"changefloatingmode",
-)
+OPENWINDOW_PREFIX = b"openwindow>>"
+CLOSEWINDOW_PREFIX = b"closewindow>>"
+MOVEWINDOW_PREFIX = b"movewindowv2>>"
+WORKSPACE_PREFIX = b"workspacev2>>"
+FOCUSEDMON_PREFIX = b"focusedmon>>"
 SCROLL_THRESHOLD = 25      # touchpad Y units per wheel click; tune to taste
 NATURAL_SCROLL = True
 
@@ -42,19 +43,85 @@ def find_touchpad():
     return None
 
 
-def ws_is_kitty_only():
-    try:
-        ws = json.loads(subprocess.check_output(["hyprctl", "activeworkspace", "-j"]))
-        wsid = ws.get("id")
-        if wsid is None:
+class WorldState:
+    """Local mirror of windows + active workspace, kept fresh from socket2.
+
+    Avoids races where hyprctl clients/activeworkspace lag behind the events
+    (openwindow before workspace assignment is queryable, closewindow before
+    the row is dropped, etc.).
+    """
+
+    def __init__(self):
+        # address -> (workspace_id, class)
+        self.windows = {}
+        self.active_ws = None
+        self.seed_from_hyprctl()
+
+    def seed_from_hyprctl(self):
+        try:
+            ws = json.loads(subprocess.check_output(["hyprctl", "activeworkspace", "-j"]))
+            self.active_ws = ws.get("id")
+            clients = json.loads(subprocess.check_output(["hyprctl", "clients", "-j"]))
+            fresh = {}
+            for c in clients:
+                addr = c.get("address")
+                wsid = c.get("workspace", {}).get("id")
+                cls = c.get("class") or ""
+                if addr:
+                    fresh[self._norm_addr(addr.encode())] = (wsid, cls)
+            self.windows = fresh
+        except Exception:
+            pass
+
+    @staticmethod
+    def _norm_addr(addr_bytes):
+        s = addr_bytes.decode(errors="ignore").strip()
+        return s if s.startswith("0x") else "0x" + s
+
+    def on_openwindow(self, payload):
+        # ADDR,WORKSPACENAME,CLASS,TITLE
+        parts = payload.split(b",", 3)
+        if len(parts) < 3:
+            return
+        addr = self._norm_addr(parts[0])
+        # workspace name -> id is non-trivial; use active_ws as best guess and
+        # let movewindowv2 correct it. New windows almost always open on the
+        # active workspace anyway.
+        cls = parts[2].decode(errors="ignore")
+        self.windows[addr] = (self.active_ws, cls)
+
+    def on_closewindow(self, payload):
+        addr = self._norm_addr(payload)
+        self.windows.pop(addr, None)
+
+    def on_movewindow(self, payload):
+        # movewindowv2: ADDR,WSID,WSNAME
+        parts = payload.split(b",", 2)
+        if len(parts) < 2:
+            return
+        addr = self._norm_addr(parts[0])
+        try:
+            wsid = int(parts[1])
+        except ValueError:
+            return
+        cls = self.windows.get(addr, (None, ""))[1]
+        self.windows[addr] = (wsid, cls)
+
+    def on_workspace(self, payload):
+        # workspacev2: WSID,WSNAME
+        parts = payload.split(b",", 1)
+        try:
+            self.active_ws = int(parts[0])
+        except (ValueError, IndexError):
+            pass
+
+    def is_kitty_only(self):
+        if self.active_ws is None:
             return False
-        clients = json.loads(subprocess.check_output(["hyprctl", "clients", "-j"]))
-        on_ws = [c for c in clients if c.get("workspace", {}).get("id") == wsid]
+        on_ws = [cls for (wsid, cls) in self.windows.values() if wsid == self.active_ws]
         if not on_ws:
             return False
-        return all(c.get("class") == TERMINAL_CLASS for c in on_ws)
-    except Exception:
-        return False
+        return all(cls == TERMINAL_CLASS for cls in on_ws)
 
 
 class ScrollSynth:
@@ -126,16 +193,18 @@ class FilterDaemon:
         self.dev = dev
         self.synth = None
         self.grabbed = False
+        self.world = WorldState()
 
     def set_blocked(self, want):
         if want and not self.grabbed:
             try:
                 self.dev.grab()
             except OSError as ex:
-                print(f"grab failed: {ex}", file=sys.stderr)
+                print(f"grab failed: {ex}", file=sys.stderr, flush=True)
                 return
             self.synth = ScrollSynth()
             self.grabbed = True
+            print("touchpad: grabbed (kitty-only)", file=sys.stderr, flush=True)
         elif not want and self.grabbed:
             try:
                 self.dev.ungrab()
@@ -145,9 +214,10 @@ class FilterDaemon:
                 self.synth.close()
                 self.synth = None
             self.grabbed = False
+            print("touchpad: released", file=sys.stderr, flush=True)
 
     def evaluate(self):
-        self.set_blocked(ws_is_kitty_only())
+        self.set_blocked(self.world.is_kitty_only())
 
     def run(self):
         runtime = Path(os.environ["XDG_RUNTIME_DIR"])
@@ -167,6 +237,14 @@ class FilterDaemon:
                     rlist.append(self.dev.fileno())
                 r, _, _ = select.select(rlist, [], [], 1.0)
 
+                if not r:
+                    # idle tick: re-seed from hyprctl as a safety net so any
+                    # local-state desync (missed/garbled event, address-format
+                    # drift, etc.) self-corrects within ~1s.
+                    self.world.seed_from_hyprctl()
+                    self.evaluate()
+                    continue
+
                 if sock.fileno() in r:
                     try:
                         data = sock.recv(4096)
@@ -177,7 +255,25 @@ class FilterDaemon:
                     buf += data
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
-                        if any(line.startswith(p) for p in HYPR_EVENT_PREFIXES):
+                        changed = False
+                        if line.startswith(OPENWINDOW_PREFIX):
+                            self.world.on_openwindow(line[len(OPENWINDOW_PREFIX):])
+                            changed = True
+                        elif line.startswith(CLOSEWINDOW_PREFIX):
+                            self.world.on_closewindow(line[len(CLOSEWINDOW_PREFIX):])
+                            changed = True
+                        elif line.startswith(MOVEWINDOW_PREFIX):
+                            self.world.on_movewindow(line[len(MOVEWINDOW_PREFIX):])
+                            changed = True
+                        elif line.startswith(WORKSPACE_PREFIX):
+                            self.world.on_workspace(line[len(WORKSPACE_PREFIX):])
+                            changed = True
+                        elif line.startswith(FOCUSEDMON_PREFIX):
+                            # focused monitor change can switch active ws;
+                            # cheapest correct fix is a hyprctl re-seed.
+                            self.world.seed_from_hyprctl()
+                            changed = True
+                        if changed:
                             self.evaluate()
 
                 if self.grabbed and self.dev.fileno() in r:
