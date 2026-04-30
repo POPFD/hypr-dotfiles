@@ -91,6 +91,7 @@ button:hover {
 #idle_inhibitor,
 #scratchpad,
 #power-profiles-daemon,
+#keyboard-state,
 #mpd {
     padding: 5px 15px;
     color: #ffffff;
@@ -218,10 +219,6 @@ label:focus {
 }
 
 #keyboard-state {
-    background: #97e1ad;
-    color: #000000;
-    padding: 0 0px;
-    margin: 0 5px;
     min-width: 16px;
 }
 
@@ -230,7 +227,11 @@ label:focus {
 }
 
 #keyboard-state > label.locked {
-    background: rgba(0, 0, 0, 0.2);
+    background: rgba(255, 255, 255, 0.2);
+}
+
+#keyboard-state > label.unlock {
+
 }
 
 #scratchpad {
