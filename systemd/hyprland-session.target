@@ -1,0 +1,9 @@
+[Unit]
+Description=Hyprland compositor session
+Documentation=man:systemd.special(7)
+# Bringing this target up activates the passive graphical-session.target,
+# which the shipped waybar.service (and any other WantedBy= it) hangs off of.
+# BindsTo ensures those services are torn down when the session target stops.
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
